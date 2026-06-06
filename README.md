@@ -10,6 +10,7 @@ Extra search sources for [LitFinder](https://github.com/NemesisHubris/litfinder)
 |---|---|---|
 | `project_gutenberg.py` | ~75,000 free public-domain books | EPUB |
 | `librivox.py` | Free public-domain audiobooks | M4B / MP3 / Torrent |
+| `libby_source.py` | Your borrowed Libby / OverDrive audiobooks | M4B |
 
 ---
 
@@ -32,3 +33,5 @@ The sources will show up in **Settings → Release Sources → Custom Sources** 
 **Project Gutenberg** — You may see multiple results for the same book. That's normal — Project Gutenberg has separate entries for different editions (e.g. with or without images, different base texts). Use the *Max Editions* setting to control how many show up.
 
 **LibriVox** — Downloads the pre-built M4B by default (single file with chapters, works great with Audiobookshelf). You can switch to MP3 ZIP or Torrent in settings. Torrent requires a download client configured in LitFinder.
+
+**Libby** — Requires a Libby / OverDrive account with active borrows. Enter your library's OverDrive website ID, library card number, and PIN in settings. Search results only show titles you currently have borrowed. Downloads as a single M4B with chapter markers — ffmpeg must be in PATH (Docker images already include it).
