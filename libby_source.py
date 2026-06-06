@@ -840,18 +840,21 @@ def _build_m4b(
     meta_file = tmp_dir / "meta.txt"
     meta_file.write_text("\n".join(meta_lines))
 
+    # All -i inputs must come before any output options; -map_metadata after maps.
     cmd = [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0", "-i", str(concat_file),
         "-i", str(meta_file),
-        "-map_metadata", "1",
     ]
     if cover_path and cover_path.exists():
-        cmd += ["-i", str(cover_path), "-map", "0:a", "-map", "2:v",
+        cmd += ["-i", str(cover_path)]
+        cmd += ["-map", "0:a", "-map", "2:v", "-map_metadata", "1",
                 "-disposition:v", "attached_pic"]
     else:
-        cmd += ["-map", "0:a"]
-    cmd += ["-c:a", "copy", "-c:v", "copy", str(out_path)]
+        cmd += ["-map", "0:a", "-map_metadata", "1"]
+    # M4B requires AAC — transcode from MP3 at a reasonable quality.
+    # 64k is standard for audiobooks (spoken word, not music).
+    cmd += ["-c:a", "aac", "-b:a", "64k", "-c:v", "copy", str(out_path)]
 
     subprocess.run(cmd, check=True, capture_output=True)
 
