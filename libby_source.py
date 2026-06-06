@@ -9,23 +9,21 @@ actually works (confirmed by LibbyRip's author) is to hook JSON.parse inside
 the Libby listen page and intercept the odreadCmptParams array before Libby
 removes it from the page.
 
-  search()  → Libby Patron API (sentry.libbyapp.com) to list your loans
+  search()  → OverDrive catalog search + Patron API cross-reference for
+               availability (borrow/hold/already-borrowed)
   download() → Playwright headless browser + JSON.parse hook to capture
                signed chapter URLs, then sequential download + M4B merge
 
+Auth is handled entirely from your library card credentials entered in
+settings — no browser setup, no saved profile, no manual login step.
+The plugin authenticates server-side via the OverDrive Patron API and
+injects the session token into a fresh headless browser via route
+interception, so no browser ever appears.
+
 SETUP
 -----
-Playwright must be installed in the LitFinder Python environment:
   pip install playwright && playwright install chromium
-
-First-time login: run the bundled libby_dl.py script once to open a real
-browser and log in to Libby. It saves a browser profile that this plugin
-then reuses headlessly.
-
-  python libby_dl.py --profile /config/plugins/libby_profile
-
-After that, set the profile path in settings and the plugin handles
-everything automatically.
+  ffmpeg must be in PATH (standard Docker images already include it)
 """
 
 from __future__ import annotations
@@ -278,11 +276,6 @@ def _place_hold(chip: str, card: dict, title_id: str) -> bool:
     return r.ok
 
 
-def _default_profile_dir() -> Path:
-    from shelfmark.config.env import CONFIG_DIR
-    return CONFIG_DIR / "plugins" / "libby_profile"
-
-
 # ── Source ─────────────────────────────────────────────────────────────────────
 
 @register_source(SOURCE_NAME)
@@ -296,8 +289,7 @@ class LibbySource(ReleaseSource):
         from shelfmark.core.config import config
         has_clone = bool(config.get("LIBBY_CLONE_CODE"))
         has_card = bool(config.get("LIBBY_WEBSITE_ID") and config.get("LIBBY_CARD_NUMBER"))
-        has_profile = _default_profile_dir().exists()
-        return has_clone or has_card or bool(_load_chip()) or has_profile
+        return has_clone or has_card or bool(_load_chip())
 
     def search(
         self,
@@ -571,117 +563,127 @@ class LibbyHandler(DownloadHandler):
                 "pip install playwright && playwright install chromium"
             )
 
-        profile_str = str(config.get("LIBBY_PROFILE_DIR", "")).strip()
-        profile_dir = Path(profile_str) if profile_str else _default_profile_dir()
-
-        if not profile_dir.exists():
-            raise RuntimeError(
-                f"Browser profile not found at {profile_dir}. "
-                "Run 'python libby_dl.py --profile {profile_dir}' once to log in to Libby, "
-                "then try downloading again."
-            )
+        # Get our chip token — this is what authenticates the browser session
+        chip = _ensure_chip()
 
         safe_name = _safe_filename(f"{book_author} - {book_title}")
         tmp_dir = TMP_DIR / f"libby_{task.task_id}"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
         status_callback("resolving", "Opening Libby player…")
-
         book_data = None
 
         with sync_playwright() as pw:
-            browser = pw.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir),
+            # Fresh browser context every time — no saved profile needed.
+            # We inject auth by intercepting Libby's own POST /chip request
+            # and substituting our pre-authenticated chip token.  Libby's
+            # JavaScript receives the token, uses it for /chip/sync, and loads
+            # the full account (cards + loans) exactly as in the real app.
+            browser = pw.chromium.launch(
                 headless=True,
                 args=["--disable-blink-features=AutomationControlled"],
             )
-            browser.add_init_script(_HOOK_JS)
+            context = browser.new_context(
+                user_agent=_UA,
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            )
+            context.add_init_script(_HOOK_JS)
 
-            page = browser.new_page()
-            page.set_extra_http_headers({"User-Agent": _UA})
+            def _route_chip(route):
+                url = route.request.url
+                # Let sync and clone requests through — they carry Bearer token
+                # in the header and work fine with our chip.
+                if any(k in url for k in ("sync", "clone", "fulfill")):
+                    route.continue_()
+                    return
+                # Intercept the initial chip POST/GET that bootstraps the app.
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"identity": chip, "chip": chip, "result": "ok"}),
+                )
 
+            context.route("**/sentry.libbyapp.com/chip**", _route_chip)
+            context.route("**/sentry-read.svc.overdrive.com/chip**", _route_chip)
+
+            page = context.new_page()
             listen_page = None
 
-            # Try direct listen URL if we have the advantage key
+            # Navigate to the book's listen page.
+            # Try the direct deep-link first (libbyapp.com → listen.libbyapp.com).
             if advantage_key:
-                candidate = (
-                    f"https://libbyapp.com/library/{advantage_key}"
-                    f"/audiobooks/media/{title_id}/listen"
-                )
                 try:
-                    page.goto(candidate, timeout=20000)
-                    # Check if we landed on a listen page
+                    page.goto(
+                        f"https://libbyapp.com/library/{advantage_key}"
+                        f"/audiobooks/media/{title_id}/listen",
+                        timeout=25000,
+                    )
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    time.sleep(2)
+                    for p in context.pages:
+                        if "listen.libbyapp.com" in p.url or "listen.overdrive.com" in p.url:
+                            listen_page = p
+                            break
+                    if not listen_page and (
+                        "listen.libbyapp.com" in page.url
+                        or "listen.overdrive.com" in page.url
+                    ):
+                        listen_page = page
+                except Exception:
+                    pass
+
+            # Fall back: loans shelf → click Listen for this title
+            if not listen_page:
+                page.goto("https://libbyapp.com/shelf/loans", timeout=30000)
+                page.wait_for_load_state("networkidle", timeout=30000)
+                time.sleep(2)
+
+                for selector in [
+                    f'[data-media-id="{title_id}"] a[href*="listen"]',
+                    f'a[href*="{title_id}"][href*="listen"]',
+                ]:
+                    try:
+                        el = page.locator(selector).first
+                        if el.is_visible(timeout=2000):
+                            el.click()
+                            break
+                    except Exception:
+                        continue
+                else:
+                    # Click book card by title, then click Listen button
+                    try:
+                        page.get_by_text(book_title[:40], exact=False).first.click(timeout=5000)
+                        time.sleep(1)
+                        for btn in ["Listen", "Open", "Play"]:
+                            try:
+                                page.get_by_role("link", name=btn).first.click(timeout=2000)
+                                break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                deadline = time.time() + 30
+                while time.time() < deadline:
+                    for p in context.pages:
+                        if "listen.libbyapp.com" in p.url or "listen.overdrive.com" in p.url:
+                            listen_page = p
+                            break
+                    if listen_page:
+                        break
                     if "listen.libbyapp.com" in page.url or "listen.overdrive.com" in page.url:
                         listen_page = page
-                    elif "listen" in page.url.lower():
-                        listen_page = page
-                except Exception:
-                    pass
-
-            # Fall back: navigate to loans shelf and click Listen on the right book
-            if not listen_page:
-                try:
-                    page.goto("https://libbyapp.com/shelf/loans", timeout=30000)
-                    page.wait_for_load_state("domcontentloaded", timeout=20000)
-                    time.sleep(3)  # let the SPA render
-
-                    # Look for a link/button near the book title
-                    clicked = False
-                    for selector in [
-                        f'[data-media-id="{title_id}"] a[href*="listen"]',
-                        f'a[href*="{title_id}"][href*="listen"]',
-                    ]:
-                        try:
-                            el = page.locator(selector).first
-                            if el.is_visible(timeout=2000):
-                                el.click()
-                                clicked = True
-                                break
-                        except Exception:
-                            continue
-
-                    if not clicked:
-                        # Try clicking via title text match
-                        try:
-                            page.get_by_text(book_title[:30], exact=False).first.click(timeout=5000)
-                            time.sleep(1)
-                            # Click Listen if a dialog/panel appeared
-                            for txt in ["Listen", "Open", "Play"]:
-                                try:
-                                    page.get_by_role("link", name=txt).first.click(timeout=3000)
-                                    break
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-
-                    # Wait for listen.libbyapp.com to open
-                    deadline = time.time() + 30
-                    while time.time() < deadline:
-                        for p in browser.pages:
-                            if "listen.libbyapp.com" in p.url or "listen.overdrive.com" in p.url:
-                                listen_page = p
-                                break
-                        if listen_page:
-                            break
-                        # Also check if the current page navigated there
-                        if "listen.libbyapp.com" in page.url or "listen.overdrive.com" in page.url:
-                            listen_page = page
-                            break
-                        time.sleep(1)
-                except Exception:
-                    pass
+                        break
+                    time.sleep(1)
 
             if not listen_page:
                 browser.close()
                 raise RuntimeError(
-                    "Could not navigate to the Libby listen page. "
-                    "Make sure you're logged in and have this book borrowed "
-                    f"(title_id={title_id}, advantage_key={advantage_key}). "
-                    "If the profile is outdated, re-run libby_dl.py to refresh the login."
+                    f"Could not open the Libby listen page for '{book_title}'. "
+                    "The book may not be in your loans yet — try again in a moment, "
+                    "or check that it is actually borrowed in the Libby app."
                 )
 
-            # Make sure the hook is present (page may have loaded before context hook)
             try:
                 listen_page.evaluate(_HOOK_JS)
             except Exception:
@@ -689,21 +691,19 @@ class LibbyHandler(DownloadHandler):
 
             status_callback("resolving", "Waiting for chapter URLs…")
 
-            # Poll for params (up to 90s)
             deadline = time.time() + 90
             while time.time() < deadline:
                 if cancel_flag.is_set():
                     browser.close()
                     return None
-                ready = listen_page.evaluate("() => !!window.__ld_params")
-                if ready:
+                if listen_page.evaluate("() => !!window.__ld_params"):
                     break
                 time.sleep(1)
             else:
                 browser.close()
                 raise RuntimeError(
                     "Timed out waiting for chapter tokens from Libby. "
-                    "The book player may not have fully loaded."
+                    "The player may not have fully loaded."
                 )
 
             book_data = listen_page.evaluate(_EXTRACT_JS)
@@ -870,31 +870,22 @@ def get_settings_fields() -> list:
             key="LIBBY_HEADING",
             title="Libby",
             description=(
-                "Downloads your borrowed Libby audiobooks using a headless browser "
-                "(Playwright) to capture the signed chapter URLs — this is the only "
-                "method that works with Libby's current DRM approach.\n\n"
+                "Downloads your borrowed Libby audiobooks. Enter your library card "
+                "credentials below — no browser setup or manual login required. "
+                "The plugin authenticates entirely from these settings.\n\n"
                 "REQUIREMENTS:\n"
                 "• pip install playwright && playwright install chromium\n"
-                "• One-time browser login (see Profile Path below)\n\n"
-                "STEP 1 — Set up the browser profile:\n"
-                "Run this once from the command line to log in to Libby and save the session:\n"
-                "  python libby_dl.py --profile /config/plugins/libby_profile\n"
-                "Navigate to a borrowed audiobook and click Listen, then the script will save "
-                "your session and you can close it.\n\n"
-                "STEP 2 — Account auth for search results (shows your borrowed books):\n"
-                "Use the Clone Code method (recommended) or card credentials below."
+                "• ffmpeg in PATH (included in the standard Docker image)"
             ),
-        ),
-        TextField(
-            key="LIBBY_PROFILE_DIR",
-            label="Browser Profile Path",
-            description="Path to the saved Libby browser profile. Defaults to /config/plugins/libby_profile.",
-            placeholder="/config/plugins/libby_profile",
         ),
         HeadingField(
             key="LIBBY_AUTH_HEADING",
-            title="Account (for Search Results)",
-            description="Links your Libby account so the plugin can list your loans.",
+            title="Account",
+            description=(
+                "Enter your library card details to search your loans and download audiobooks. "
+                "Use the Clone Code method if you already have the Libby app, "
+                "or enter your card number and PIN directly."
+            ),
         ),
         TextField(
             key="LIBBY_CLONE_CODE",

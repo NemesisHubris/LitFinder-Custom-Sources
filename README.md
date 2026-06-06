@@ -34,4 +34,4 @@ The sources will show up in **Settings → Release Sources → Custom Sources** 
 
 **LibriVox** — Downloads the pre-built M4B by default (single file with chapters, works great with Audiobookshelf). You can switch to MP3 ZIP or Torrent in settings. Torrent requires a download client configured in LitFinder.
 
-**Libby** — Requires a Libby / OverDrive account with active borrows. Enter your library's OverDrive website ID, library card number, and PIN in settings. Search results only show titles you currently have borrowed. Downloads as a single M4B with chapter markers — ffmpeg must be in PATH (Docker images already include it).
+**Libby** — Requires a Libby / OverDrive account. Enter your library's OverDrive website ID, library card number, and PIN in settings — no browser setup or manual login needed. Search results show the full OverDrive catalog with availability (borrowed, available to borrow, or holdable). Downloads as a single M4B with chapter markers — ffmpeg and Playwright must be installed (see settings for instructions).
