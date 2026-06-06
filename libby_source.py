@@ -53,9 +53,13 @@ if TYPE_CHECKING:
 
 SOURCE_NAME = "libby"
 
-_API = "https://sentry-read.svc.overdrive.com"
+# sentry-read.svc.overdrive.com was replaced by sentry.libbyapp.com in late 2024
+_API = "https://sentry.libbyapp.com"
 _SESSION = requests.Session()
-_SESSION.headers["User-Agent"] = "Libby/8.0.0 (Android)"
+_SESSION.headers["User-Agent"] = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) (Dewey; V22; iOS; 6.3.0-160)"
+)
 _SESSION.headers["Accept"] = "application/json"
 
 
@@ -77,13 +81,14 @@ def _load_chip() -> str | None:
     return _load_chip_data().get("chip") or None
 
 
-def _save_chip(chip: str, card_key: str | None = None) -> None:
+def _save_chip(chip: str, card_key: str | None = None, clone_code: str | None = None) -> None:
     f = _chip_file()
     f.parent.mkdir(parents=True, exist_ok=True)
+    existing = _load_chip_data()
     data: dict = {"chip": chip}
-    if card_key:
-        data["card_key"] = card_key
-    f.write_text(json.dumps(data))
+    data["card_key"] = card_key or existing.get("card_key")
+    data["clone_code"] = clone_code or existing.get("clone_code")
+    f.write_text(json.dumps({k: v for k, v in data.items() if v is not None}))
 
 
 def _card_key(website_id: str, card_number: str) -> str:
@@ -91,7 +96,7 @@ def _card_key(website_id: str, card_number: str) -> str:
 
 
 def _ensure_chip() -> str:
-    """Return a valid chip token, creating one if needed."""
+    """Return a valid identity token, creating one if needed."""
     chip = _load_chip()
     if chip:
         try:
@@ -103,9 +108,24 @@ def _ensure_chip() -> str:
 
     r = _SESSION.post(f"{_API}/chip", params={"client": "dewey"}, timeout=15)
     r.raise_for_status()
-    chip = r.json()["chip"]
+    # API returns "identity" field (was "chip" in older API versions)
+    data = r.json()
+    chip = data.get("identity") or data.get("chip") or ""
+    if not chip:
+        raise RuntimeError(f"Unexpected chip response: {list(data.keys())}")
     _save_chip(chip)
     return chip
+
+
+def _clone_with_code(chip: str, code: str) -> bool:
+    """Clone a Libby account into this chip using a code from the Libby app."""
+    r = _SESSION.post(
+        f"{_API}/chip/clone/code",
+        json={"code": code.replace("-", "").replace(" ", "")},
+        headers=_auth_headers(chip),
+        timeout=15,
+    )
+    return r.ok
 
 
 def _auth_headers(chip: str) -> dict[str, str]:
@@ -158,7 +178,9 @@ class LibbySource(ReleaseSource):
 
     def is_available(self) -> bool:
         from shelfmark.core.config import config
-        return bool(config.get("LIBBY_WEBSITE_ID") and config.get("LIBBY_CARD_NUMBER"))
+        has_clone = bool(config.get("LIBBY_CLONE_CODE"))
+        has_card = bool(config.get("LIBBY_WEBSITE_ID") and config.get("LIBBY_CARD_NUMBER"))
+        return has_clone or has_card or bool(_load_chip())
 
     def search(
         self,
@@ -181,27 +203,42 @@ class LibbySource(ReleaseSource):
         except requests.RequestException as e:
             raise SourceUnavailableError(f"Libby: chip auth failed — {e}") from e
 
-        # Link card if no cards yet, or if credentials changed since last link
+        # Clone account via code if provided and not already done
+        clone_code = str(config.get("LIBBY_CLONE_CODE", "")).strip().replace("-", "").replace(" ", "")
+
         try:
             sync_data = _sync(chip)
         except requests.RequestException as e:
             raise SourceUnavailableError(f"Libby: sync failed — {e}") from e
 
-        current_key = _card_key(website_id, card_number) if website_id and card_number else None
-        saved_key = _load_chip_data().get("card_key")
-        need_link = bool(current_key and (not sync_data.get("cards") or current_key != saved_key))
-
-        if need_link:
-            _link_card(chip, website_id, card_number, pin)
-            _save_chip(chip, current_key)
+        saved_clone = _load_chip_data().get("clone_code")
+        if clone_code and clone_code != saved_clone:
+            _clone_with_code(chip, clone_code)
+            _save_chip(chip, card_key=_load_chip_data().get("card_key"), clone_code=clone_code)
             try:
                 sync_data = _sync(chip)
             except requests.RequestException as e:
-                raise SourceUnavailableError(f"Libby: sync after link failed — {e}") from e
+                raise SourceUnavailableError(f"Libby: sync after clone failed — {e}") from e
+
+        # Fall back to card number + PIN link if clone code not used
+        elif not sync_data.get("cards") and website_id and card_number:
+            current_key = _card_key(website_id, card_number)
+            saved_key = _load_chip_data().get("card_key")
+            if not saved_key or current_key != saved_key:
+                _link_card(chip, website_id, card_number, pin)
+                _save_chip(chip, card_key=current_key)
+                try:
+                    sync_data = _sync(chip)
+                except requests.RequestException as e:
+                    raise SourceUnavailableError(f"Libby: sync after link failed — {e}") from e
 
         loans: list[dict] = sync_data.get("loans", [])
-        # Only audiobooks
-        loans = [l for l in loans if l.get("type", {}).get("id") == "audiobook"]
+        # Only audiobooks — format field is "audiobook-mp3" or type.id is "audiobook"
+        loans = [
+            l for l in loans
+            if (l.get("type", {}).get("id") == "audiobook"
+                or str(l.get("formats", [{}])[0].get("id", "") if l.get("formats") else "").startswith("audiobook"))
+        ]
 
         query_words = set(_words(book.search_title or book.title))
         author_words = set(_words(book.search_author or ""))
@@ -228,7 +265,8 @@ class LibbySource(ReleaseSource):
 
             author = loan.get("firstCreatorName", "Unknown Author")
             card_id = str(loan.get("cardId", ""))
-            title_id = str(loan.get("titleId", ""))
+            # API used "titleId" historically; current format uses "id"
+            title_id = str(loan.get("id") or loan.get("titleId", ""))
 
             dur_s = loan.get("type", {}).get("duration", 0) or 0
             if dur_s:
@@ -505,26 +543,40 @@ def get_settings_fields() -> list:
             key="LIBBY_HEADING",
             title="Libby",
             description=(
-                "Downloads borrowed audiobooks directly from your Libby / OverDrive account "
-                "using the same API as the official Libby app — no browser required. "
-                "Search results show only titles you currently have borrowed on Libby. "
+                "Downloads borrowed audiobooks from your Libby account using the Libby API. "
+                "Search results show only titles you currently have borrowed. "
                 "\n\n"
-                "To find your Library Website ID: search for your library at "
-                "https://api.overdrive.com/v1/libraries?query=YOUR+LIBRARY+NAME "
-                "and use the 'id' field. Or look at your library's OverDrive URL — "
-                "the ID is the number after /library/ when browsing OverDrive."
+                "RECOMMENDED SETUP — Clone Code (easiest):\n"
+                "1. Open the Libby app on your phone\n"
+                "2. Tap the icon in the top-left corner\n"
+                "3. Tap Copy My Libby → Get a code\n"
+                "4. Enter the 8-digit code below\n"
+                "\n"
+                "ALTERNATIVE — Card credentials (if you don't have the app):\n"
+                "Fill in Library Website ID + Card Number + PIN below instead."
             ),
+        ),
+        TextField(
+            key="LIBBY_CLONE_CODE",
+            label="Libby Clone Code",
+            description="8-digit code from Libby app → Copy My Libby → Get a code. Used once to link your account.",
+            placeholder="1234 5678",
+        ),
+        HeadingField(
+            key="LIBBY_CARD_HEADING",
+            title="— or use card credentials —",
+            description="Fill these in if you don't have the Libby app for the clone code.",
         ),
         TextField(
             key="LIBBY_WEBSITE_ID",
             label="Library Website ID",
-            description="Your library's OverDrive website ID (a number, e.g. 48). If changed, your card re-links automatically.",
+            description="Your library's OverDrive website ID (a number). Find it in your library's OverDrive URL.",
             placeholder="48",
         ),
         TextField(
             key="LIBBY_CARD_NUMBER",
             label="Library Card Number",
-            description="Your library card barcode number. If changed, your card re-links automatically.",
+            description="Your library card barcode number.",
         ),
         PasswordField(
             key="LIBBY_PIN",
