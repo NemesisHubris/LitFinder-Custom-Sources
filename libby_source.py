@@ -67,6 +67,7 @@ SOURCE_NAME = "libby"
 
 # sentry-read.svc.overdrive.com was replaced by sentry.libbyapp.com in late 2024
 _API = "https://sentry.libbyapp.com"
+_THUNDER = "https://thunder.api.overdrive.com"
 _UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) (Dewey; V22; iOS; 6.3.0-160)"
@@ -202,6 +203,81 @@ def _sync(chip: str) -> dict:
     return r.json()
 
 
+def _catalog_search(advantage_key: str, query: str, limit: int = 20) -> list[dict]:
+    """Search the OverDrive catalog for audiobooks."""
+    r = _SESSION.get(
+        f"{_THUNDER}/v2/libraries/{advantage_key}/media",
+        params={
+            "query": query,
+            "format": "audiobook-mp3,audiobook-overdrive",
+            "perPage": limit,
+            "page": 1,
+            "x-client-id": "dewey",
+        },
+        timeout=20,
+    )
+    if not r.ok:
+        return []
+    return r.json().get("items", [])
+
+
+def _check_availability(advantage_key: str, title_ids: list[str]) -> dict[str, dict]:
+    """Return availability info keyed by title ID."""
+    if not title_ids:
+        return {}
+    r = _SESSION.post(
+        f"{_THUNDER}/v2/libraries/{advantage_key}/media/availability",
+        params={"x-client-id": "dewey"},
+        json={"ids": title_ids},
+        timeout=20,
+    )
+    if not r.ok:
+        return {}
+    items = r.json().get("items", [])
+    return {
+        title_ids[i]: items[i]
+        for i in range(min(len(title_ids), len(items)))
+        if items[i] is not None
+    }
+
+
+def _borrow(chip: str, card: dict, title_id: str) -> bool:
+    """Borrow a title using the given card. Returns True on success."""
+    periods = card.get("lendingPeriods", {}).get("book", {}).get("preference", [21, "day"])
+    r = _SESSION.post(
+        f"{_API}/card/{card['cardId']}/loan/{title_id}",
+        headers={"Authorization": f"Bearer {chip}"},
+        json={
+            "period": periods[0] if len(periods) > 0 else 21,
+            "units": periods[1] if len(periods) > 1 else "day",
+            "lucky_day": None,
+            "title_format": "audiobook-mp3",
+            "reporting_context": {
+                "clientName": "Dewey",
+                "clientVersion": "6.3.0",
+                "environment": "charlie",
+            },
+        },
+        timeout=20,
+    )
+    return r.ok
+
+
+def _place_hold(chip: str, card: dict, title_id: str) -> bool:
+    """Place a hold on a title. Returns True on success."""
+    r = _SESSION.post(
+        f"{_API}/card/{card['cardId']}/hold/{title_id}",
+        headers={"Authorization": f"Bearer {chip}"},
+        json={
+            "days_to_suspend": 0,
+            "email_address": card.get("emailAddress") or "",
+            "title_format": "audiobook-mp3",
+        },
+        timeout=20,
+    )
+    return r.ok
+
+
 def _default_profile_dir() -> Path:
     from shelfmark.config.env import CONFIG_DIR
     return CONFIG_DIR / "plugins" / "libby_profile"
@@ -269,72 +345,117 @@ class LibbySource(ReleaseSource):
                 except requests.RequestException as e:
                     raise SourceUnavailableError(f"Libby: sync after card link failed — {e}") from e
 
-        loans: list[dict] = sync_data.get("loans", [])
         cards: list[dict] = sync_data.get("cards", [])
-
-        # Build cardId → advantageKey map for later use in URL construction
-        card_advantage: dict[str, str] = {
-            str(c.get("cardId", "")): c.get("advantageKey", "")
-            for c in cards
-        }
-
-        # Filter to audiobooks
-        loans = [
-            l for l in loans
-            if l.get("type", {}).get("id") == "audiobook"
-            or any(
-                str(f.get("id", "")).startswith("audiobook")
-                for f in (l.get("formats") or [])
-            )
-        ]
-
-        if not loans and not sync_data.get("cards"):
+        if not cards:
             raise SourceUnavailableError(
                 "Libby: no library cards linked. Enter a Clone Code or card credentials in settings."
             )
 
-        query_words = set(_words(book.search_title or book.title))
-        author_words = set(_words(book.search_author or ""))
+        # Build lookup maps from sync data
+        card_by_id: dict[str, dict] = {str(c.get("cardId", "")): c for c in cards}
+        card_advantage: dict[str, str] = {
+            str(c.get("cardId", "")): c.get("advantageKey", "") for c in cards
+        }
+        loaned_ids: set[str] = {
+            str(l.get("id") or l.get("titleId", ""))
+            for l in sync_data.get("loans", [])
+        }
+        loan_by_id: dict[str, dict] = {
+            str(l.get("id") or l.get("titleId", "")): l
+            for l in sync_data.get("loans", [])
+        }
+
+        query = book.search_title or book.title
+        author_q = book.search_author or ""
+        catalog_query = f"{query} {author_q}".strip() if (not expand_search and author_q) else query
+
+        # Search catalog across all linked cards' libraries
+        catalog_items: list[dict] = []
+        seen_ids: set[str] = set()
+        for card in cards:
+            adv_key = card.get("advantageKey", "")
+            if not adv_key:
+                continue
+            try:
+                items = _catalog_search(adv_key, catalog_query, limit=10)
+                for item in items:
+                    tid = str(item.get("id", ""))
+                    if tid and tid not in seen_ids:
+                        seen_ids.add(tid)
+                        item["_advantage_key"] = adv_key
+                        item["_card"] = card
+                        catalog_items.append(item)
+            except requests.RequestException:
+                pass
+
+        if not catalog_items:
+            return []
+
+        # Check availability for all catalog results at once, per library
+        avail_by_id: dict[str, dict] = {}
+        ids_by_key: dict[str, list[str]] = {}
+        for item in catalog_items:
+            ids_by_key.setdefault(item["_advantage_key"], []).append(str(item["id"]))
+
+        for adv_key, ids in ids_by_key.items():
+            try:
+                avail_by_id.update(_check_availability(adv_key, ids))
+            except requests.RequestException:
+                pass
 
         releases: list[Release] = []
-        for loan in loans:
-            title_obj = loan.get("title", {})
-            loan_title = title_obj.get("main", "") or loan.get("title", "")
-            if isinstance(loan_title, dict):
-                loan_title = loan_title.get("main", "")
-            loan_sub = title_obj.get("subtitle", "") if isinstance(title_obj, dict) else ""
-            full_title = f"{loan_title}: {loan_sub}" if loan_sub else loan_title
+        for item in catalog_items:
+            title_id = str(item.get("id", ""))
+            if not title_id:
+                continue
 
-            if not expand_search:
-                loan_words = set(_words(full_title))
-                sig = {w for w in query_words if len(w) > 3}
-                if sig and not sig.intersection(loan_words):
-                    continue
-                if author_words:
-                    loan_author_words = set(_words(loan.get("firstCreatorName", "")))
-                    sig_a = {w for w in author_words if len(w) > 3}
-                    if sig_a and not sig_a.intersection(loan_author_words):
-                        continue
+            full_title = item.get("title", "Unknown Title")
+            author = item.get("firstCreatorName", "Unknown Author")
+            card = item["_card"]
+            card_id = str(card.get("cardId", ""))
+            advantage_key = item["_advantage_key"]
 
-            author = loan.get("firstCreatorName", "Unknown Author")
-            card_id = str(loan.get("cardId", ""))
-            title_id = str(loan.get("id") or loan.get("titleId", ""))
-            advantage_key = card_advantage.get(card_id, "")
+            avail = avail_by_id.get(title_id, {})
+            is_loaned = title_id in loaned_ids
+            is_available = avail.get("isAvailable", False)
+            is_holdable = avail.get("isHoldable", False)
+            wait_days = avail.get("estimatedWaitDays")
 
-            dur_s = loan.get("type", {}).get("duration", 0) or 0
+            # Duration from loan data if already borrowed, else from catalog
+            dur_s = 0
+            if is_loaned:
+                loan = loan_by_id.get(title_id, {})
+                dur_s = loan.get("type", {}).get("duration", 0) or 0
+            if not dur_s:
+                dur_s = item.get("duration", 0) or 0
+
             if dur_s:
                 h, m = divmod(int(dur_s) // 60, 60)
-                duration_str = f"{h}h {m:02d}m" if h else f"{m}m"
+                size_str = f"{h}h {m:02d}m" if h else f"{m}m"
             else:
-                duration_str = None
+                size_str = None
+
+            if is_loaned:
+                fmt = "m4b"
+                status = "borrowed"
+            elif is_available:
+                fmt = "borrow+rip"
+                status = "available"
+            elif is_holdable:
+                fmt = "hold"
+                wait_str = f"~{wait_days}d" if wait_days else "waitlist"
+                size_str = wait_str
+                status = "holdable"
+            else:
+                continue  # unavailable and can't hold
 
             releases.append(
                 Release(
                     source=SOURCE_NAME,
                     source_id=f"{card_id}:{title_id}",
                     title=f"{full_title} — {author}",
-                    format="m4b",
-                    size=duration_str,
+                    format=fmt,
+                    size=size_str,
                     download_url=f"libby://{card_id}/{title_id}",
                     protocol=ReleaseProtocol.HTTP,
                     indexer=self.display_name,
@@ -345,10 +466,15 @@ class LibbySource(ReleaseSource):
                         "title": full_title,
                         "author": author,
                         "advantage_key": advantage_key,
+                        "status": status,
+                        "is_loaned": is_loaned,
                     },
                 )
             )
 
+        # Borrowed books first, then available, then holds
+        _order = {"borrowed": 0, "available": 1, "holdable": 2}
+        releases.sort(key=lambda r: _order.get(r.extra.get("status", ""), 9))
         return releases
 
     def get_column_config(self) -> ReleaseColumnConfig:
@@ -356,21 +482,21 @@ class LibbySource(ReleaseSource):
             columns=[
                 ColumnSchema(
                     key="format",
-                    label="Format",
+                    label="Status",
                     render_type=ColumnRenderType.BADGE,
                     align=ColumnAlign.CENTER,
-                    width="60px",
+                    width="90px",
                     uppercase=True,
                 ),
                 ColumnSchema(
                     key="size",
-                    label="Duration",
+                    label="Duration / Wait",
                     render_type=ColumnRenderType.TEXT,
                     align=ColumnAlign.CENTER,
-                    width="80px",
+                    width="85px",
                 ),
             ],
-            grid_template="minmax(0,2fr) 60px 80px",
+            grid_template="minmax(0,2fr) 90px 85px",
         )
 
 
@@ -396,6 +522,46 @@ class LibbyHandler(DownloadHandler):
 
         if not title_id:
             raise RuntimeError("Missing title_id in task metadata")
+
+        is_loaned = task.extra.get("is_loaned", False)
+        status = task.extra.get("status", "borrowed")
+
+        if status == "holdable" and not is_loaned:
+            # Can't auto-borrow a hold-only title; place the hold instead
+            try:
+                chip = _ensure_chip()
+                sync_data = _sync(chip)
+                cards = sync_data.get("cards", [])
+                card = next((c for c in cards if str(c.get("cardId")) == card_id), None)
+                if card:
+                    _place_hold(chip, card, title_id)
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"'{book_title}' is not available to borrow right now — a hold has been placed. "
+                "Check the Libby app to see your position in the queue."
+            )
+
+        if not is_loaned and status == "available":
+            status_callback("resolving", "Borrowing from Libby…")
+            try:
+                chip = _ensure_chip()
+                sync_data = _sync(chip)
+                cards = sync_data.get("cards", [])
+                card = next((c for c in cards if str(c.get("cardId")) == card_id), None)
+                if not card and cards:
+                    card = cards[0]
+                if not card:
+                    raise RuntimeError("No library card found to borrow with")
+                if not _borrow(chip, card, title_id):
+                    raise RuntimeError(
+                        f"Borrow request failed. '{book_title}' may no longer be available."
+                    )
+                time.sleep(2)  # brief pause for the loan to activate on Libby's side
+            except RuntimeError:
+                raise
+            except Exception as e:
+                raise RuntimeError(f"Borrow failed: {e}") from e
 
         try:
             from playwright.sync_api import sync_playwright
