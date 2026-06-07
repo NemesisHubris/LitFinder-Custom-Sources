@@ -192,10 +192,21 @@ def _parse_bool(val) -> bool:
 def _get_config():
     from shelfmark.core.settings_registry import load_config_file
     cfg = load_config_file("custom_overdrive_source")
+
+    # New: OVERDRIVE_ACCOUNTS is a list of {library, card, pin} dicts from TableField
+    accounts = cfg.get("OVERDRIVE_ACCOUNTS") or []
+    accounts = [a for a in accounts if a.get("card") and a.get("pin") and a.get("library")]
+
+    # Backward compat: if no accounts table, fall back to old single-account keys
+    if not accounts:
+        library = cfg.get("OVERDRIVE_LIBRARY", "").strip()
+        card    = cfg.get("OVERDRIVE_CARD",    "").strip()
+        pin     = cfg.get("OVERDRIVE_PIN",     "").strip()
+        if card and pin:
+            accounts = [{"library": library or "multcolib", "card": card, "pin": pin}]
+
     return {
-        "library":         cfg.get("OVERDRIVE_LIBRARY",         "multcolib"),
-        "card":            cfg.get("OVERDRIVE_CARD",            ""),
-        "pin":             cfg.get("OVERDRIVE_PIN",             ""),
+        "accounts":        accounts,
         "headless":        _parse_bool(cfg.get("OVERDRIVE_HEADLESS", True)),
         "filter_language": cfg.get("OVERDRIVE_FILTER_LANGUAGE", "").strip().lower(),
     }
@@ -443,6 +454,194 @@ def _merge_to_m4b(parts: list[Path], data: dict, cover_path: Path | None,
     return out_path
 
 
+def _search_account(
+    account: dict,
+    query: str,
+    *,
+    headless: bool = True,
+    filter_lang: str = "",
+    content_type: str = "audiobook",
+    display_name: str = "OverDrive / Libby",
+) -> list[Release]:
+    """Run a full search for one OverDrive account. Returns a list of Release objects."""
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+    library  = account["library"]
+    card     = account["card"]
+    pin      = account["pin"]
+    base_url = f"https://{library}.overdrive.com"
+
+    try:
+        with sync_playwright() as pw:
+            page = _make_browser(pw, headless=headless)
+            _login(page, base_url, card, pin)
+
+            page.goto(
+                f"{base_url}/search?query={query.replace(' ', '+')}",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            time.sleep(2)
+
+            try:
+                page.wait_for_selector(".js-titleCard", timeout=10000)
+            except PWTimeout:
+                page.context.browser.close()
+                return []
+
+            # Pass 1: scrape all card data from the search results page
+            raw_cards = []
+            for card_el in page.query_selector_all(".js-titleCard"):
+                title_el  = card_el.query_selector('a[href*="/media/"]')
+                format_el = card_el.query_selector(".title-format-badge")
+                btn_el    = card_el.query_selector(".TitleActionButton")
+
+                if not title_el:
+                    continue
+                fmt = (format_el.inner_text().strip() if format_el else "").lower()
+                if "audio" not in fmt:
+                    continue
+
+                title = title_el.inner_text().strip()
+                if not title:
+                    lines = [ln.strip() for ln in card_el.inner_text().splitlines() if ln.strip()]
+                    title = lines[0] if lines else "?"
+
+                href     = title_el.get_attribute("href") or ""
+                btn_text = (btn_el.inner_text().strip().lower() if btn_el else "")
+                wait_el  = card_el.query_selector(".waitingText, [class*='waitingText']")
+                inline_wait = wait_el.inner_text().strip() if wait_el else None
+
+                author_el = (
+                    card_el.query_selector(".title-author") or
+                    card_el.query_selector(".subtitle-text") or
+                    card_el.query_selector("[class*='author' i]") or
+                    card_el.query_selector("[class*='Author']")
+                )
+                author = author_el.inner_text().strip() if author_el else ""
+                if not author:
+                    author = (card_el.get_attribute("data-author") or
+                              card_el.get_attribute("data-creators") or "")
+                author = re.sub(r"^[Bb]y\s+", "", author).strip()
+
+                lang_el = (
+                    card_el.query_selector("[data-language]") or
+                    card_el.query_selector("[class*='language' i]")
+                )
+                if lang_el:
+                    language = (lang_el.get_attribute("data-language") or
+                                lang_el.inner_text().strip()).lower()
+                else:
+                    language = card_el.get_attribute("data-language") or ""
+                language = language.lower().strip()
+
+                raw_cards.append({
+                    "title": title, "href": href,
+                    "btn_text": btn_text, "inline_wait": inline_wait,
+                    "author": author, "language": language,
+                })
+
+            # Pass 1.5: fetch language for all cards in parallel via HTTP
+            browser_cookies = {c["name"]: c["value"] for c in page.context.cookies()}
+            cards_needing_lang = [rc for rc in raw_cards if not rc["language"] and rc["href"]]
+            if cards_needing_lang:
+                urls = [
+                    f"{base_url}{rc['href']}" if not rc["href"].startswith("http") else rc["href"]
+                    for rc in cards_needing_lang
+                ]
+                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                    langs = list(pool.map(
+                        lambda url: _fetch_language_http(url, browser_cookies),
+                        urls,
+                    ))
+                for rc, lang in zip(cards_needing_lang, langs):
+                    rc["language"] = lang
+
+            # Pass 2: browser detail-page visit for Hold titles missing wait time
+            for rc in raw_cards:
+                needs_wait = (
+                    "borrow" not in rc["btn_text"] and
+                    "loan" not in rc["btn_text"] and
+                    "listen" not in rc["btn_text"] and
+                    not rc["inline_wait"] and
+                    rc["href"]
+                )
+                if not needs_wait:
+                    continue
+                detail_url = (
+                    f"{base_url}{rc['href']}" if not rc["href"].startswith("http") else rc["href"]
+                )
+                try:
+                    page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
+                    time.sleep(1)
+                    w_el = page.query_selector(".waitingText, [class*='waitingText']")
+                    c_el = page.query_selector(".CopiesAvailable, [class*='Copies']")
+                    rc["inline_wait"] = (
+                        (w_el.inner_text().strip() if w_el else None)
+                        or (c_el.inner_text().strip() if c_el else None)
+                        or "On hold"
+                    )
+                except Exception:
+                    rc["inline_wait"] = "On hold"
+
+            page.context.browser.close()
+
+        # Pass 3: build Release objects
+        _lang_map = {
+            "english": "en", "french": "fr", "spanish": "es",
+            "german": "de", "portuguese": "pt", "italian": "it",
+            "dutch": "nl", "russian": "ru", "chinese": "zh",
+            "japanese": "ja", "korean": "ko", "arabic": "ar",
+        }
+        releases: list[Release] = []
+        for rc in raw_cards:
+            href     = rc["href"]
+            media_id = href.rstrip("/").split("/")[-1]
+            info_url = f"{base_url}{href}" if not href.startswith("http") else href
+            btn_text = rc["btn_text"]
+            raw_lang = rc.get("language", "")
+            language = _lang_map.get(raw_lang, raw_lang[:2] if len(raw_lang) > 2 else raw_lang)
+
+            if filter_lang and language and language != filter_lang:
+                continue
+
+            if "borrow" in btn_text:
+                availability, wait = "Available", None
+            elif "loan" in btn_text or "listen" in btn_text:
+                availability, wait = "Borrowed", None
+            else:
+                availability = "Hold"
+                wait = rc["inline_wait"] or "On hold"
+
+            releases.append(Release(
+                source       = SOURCE_NAME,
+                source_id    = media_id,
+                title        = rc["title"],
+                format       = "m4b",
+                language     = language or None,
+                size         = wait or availability,
+                size_bytes   = None,
+                download_url = info_url,
+                info_url     = info_url,
+                protocol     = ReleaseProtocol.HTTP,
+                indexer      = display_name,
+                content_type = content_type,
+                extra        = {
+                    "media_id":     media_id,
+                    "base_url":     base_url,
+                    "availability": availability,
+                    "author":       rc.get("author", ""),
+                },
+            ))
+
+        return releases
+
+    except SourceUnavailableError:
+        raise
+    except Exception as exc:
+        raise SourceUnavailableError(f"OverDrive search failed: {exc}") from exc
+
+
 # ── Source ────────────────────────────────────────────────────────────────────
 
 @register_source(SOURCE_NAME)
@@ -453,8 +652,7 @@ class OverDriveSource(ReleaseSource):
     can_be_default: bool = True
 
     def is_available(self) -> bool:
-        cfg = _get_config()
-        return bool(cfg["card"] and cfg["pin"])
+        return bool(_get_config()["accounts"])
 
     def search(
         self,
@@ -467,187 +665,53 @@ class OverDriveSource(ReleaseSource):
         if content_type not in self.supported_content_types:
             return []
 
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+        cfg = _get_config()
+        if not cfg["accounts"]:
+            return []
 
-        cfg      = _get_config()
-        base_url = f"https://{cfg['library']}.overdrive.com"
-        query    = book.search_title or book.title
-        # Truncate to first 4 words — long titles/subtitles cause OverDrive to
-        # redirect to /audiobooks?query= which has a different layout
+        query = book.search_title or book.title
         query = " ".join(query.split()[:4])
         if book.search_author and not expand_search:
-            author_first = book.search_author.split()[0] if book.search_author else ""
+            author_first = (book.search_author.split()[0] if book.search_author else "")
             query = f"{query} {author_first}".strip()
 
-        try:
-            with sync_playwright() as pw:
-                page = _make_browser(pw, headless=cfg["headless"])
-                _login(page, base_url, cfg["card"], cfg["pin"])
+        def search_one(account: dict) -> list[Release]:
+            return _search_account(
+                account=account,
+                query=query,
+                headless=cfg["headless"],
+                filter_lang=cfg["filter_language"],
+                content_type=content_type,
+                display_name=self.display_name,
+            )
 
-                page.goto(f"{base_url}/search?query={query.replace(' ', '+')}", wait_until="domcontentloaded", timeout=60000)
-                # Wait for cards to appear instead of networkidle (avoids streaming timeouts)
-                time.sleep(2)
+        if len(cfg["accounts"]) == 1:
+            return search_one(cfg["accounts"][0])
 
+        # Multiple accounts — search all in parallel, combine results.
+        # Deduplicate by (base_url, media_id): same title available from
+        # two libraries = two distinct releases (different loans/holds).
+        all_releases: list[Release] = []
+        seen: set[tuple[str, str]] = set()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(cfg["accounts"])) as pool:
+            futures = {pool.submit(search_one, acc): acc for acc in cfg["accounts"]}
+            for future in concurrent.futures.as_completed(futures):
                 try:
-                    page.wait_for_selector(".js-titleCard", timeout=10000)
-                except PWTimeout:
-                    return []
+                    for r in future.result():
+                        key = (r.extra.get("base_url", ""), r.extra.get("media_id", ""))
+                        if key not in seen:
+                            seen.add(key)
+                            all_releases.append(r)
+                except Exception:
+                    pass  # one account failing shouldn't block others
 
-                # Pass 1: scrape all card data from the search results page
-                raw_cards = []
-                for card in page.query_selector_all(".js-titleCard"):
-                    title_el  = card.query_selector('a[href*="/media/"]')
-                    format_el = card.query_selector(".title-format-badge")
-                    btn_el    = card.query_selector(".TitleActionButton")
-
-                    if not title_el:
-                        continue
-                    fmt = (format_el.inner_text().strip() if format_el else "").lower()
-                    if "audio" not in fmt:
-                        continue
-
-                    title = title_el.inner_text().strip()
-                    if not title:
-                        lines = [l.strip() for l in card.inner_text().splitlines() if l.strip()]
-                        title = lines[0] if lines else "?"
-
-                    href     = title_el.get_attribute("href") or ""
-                    btn_text = (btn_el.inner_text().strip().lower() if btn_el else "")
-                    wait_el  = card.query_selector(".waitingText, [class*='waitingText']")
-                    inline_wait = wait_el.inner_text().strip() if wait_el else None
-
-                    # Author — try several selectors OverDrive has used across versions
-                    author_el = (
-                        card.query_selector(".title-author") or
-                        card.query_selector(".subtitle-text") or
-                        card.query_selector("[class*='author' i]") or
-                        card.query_selector("[class*='Author']")
-                    )
-                    author = author_el.inner_text().strip() if author_el else ""
-                    if not author:
-                        author = (card.get_attribute("data-author") or
-                                  card.get_attribute("data-creators") or "")
-                    # Strip leading "By " prefix that some layouts include
-                    author = re.sub(r"^[Bb]y\s+", "", author).strip()
-
-                    # Language — try card attributes first; detail-page fallback in Pass 2
-                    lang_el = (
-                        card.query_selector("[data-language]") or
-                        card.query_selector("[class*='language' i]")
-                    )
-                    if lang_el:
-                        language = (lang_el.get_attribute("data-language") or
-                                    lang_el.inner_text().strip()).lower()
-                    else:
-                        language = card.get_attribute("data-language") or ""
-                    language = language.lower().strip()
-
-                    raw_cards.append({
-                        "title": title, "href": href,
-                        "btn_text": btn_text, "inline_wait": inline_wait,
-                        "author": author, "language": language,
-                    })
-
-                # Pass 1.5: fetch language for all cards in parallel via HTTP
-                # (OverDrive detail pages are SSR so plain HTTP works — no browser nav)
-                browser_cookies = {c["name"]: c["value"] for c in page.context.cookies()}
-                cards_needing_lang = [rc for rc in raw_cards if not rc["language"] and rc["href"]]
-                if cards_needing_lang:
-                    urls = [
-                        f"{base_url}{rc['href']}" if not rc["href"].startswith("http") else rc["href"]
-                        for rc in cards_needing_lang
-                    ]
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-                        langs = list(pool.map(
-                            lambda url: _fetch_language_http(url, browser_cookies),
-                            urls,
-                        ))
-                    for rc, lang in zip(cards_needing_lang, langs):
-                        rc["language"] = lang
-
-                # Pass 2: browser detail-page visit for HOLD titles missing wait time only
-                filter_lang = cfg["filter_language"]
-                for rc in raw_cards:
-                    needs_wait = (
-                        "borrow" not in rc["btn_text"] and
-                        "loan" not in rc["btn_text"] and
-                        "listen" not in rc["btn_text"] and
-                        not rc["inline_wait"] and
-                        rc["href"]
-                    )
-                    if not needs_wait:
-                        continue
-                    detail_url = f"{base_url}{rc['href']}" if not rc["href"].startswith("http") else rc["href"]
-                    try:
-                        page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
-                        time.sleep(1)
-                        w_el = page.query_selector(".waitingText, [class*='waitingText']")
-                        c_el = page.query_selector(".CopiesAvailable, [class*='Copies']")
-                        rc["inline_wait"] = (
-                            (w_el.inner_text().strip() if w_el else None)
-                            or (c_el.inner_text().strip() if c_el else None)
-                            or "On hold"
-                        )
-                    except Exception:
-                        rc["inline_wait"] = "On hold"
-
-                # Pass 3: build Release objects
-                releases: list[Release] = []
-                for rc in raw_cards:
-                    href     = rc["href"]
-                    media_id = href.rstrip("/").split("/")[-1]
-                    info_url = f"{base_url}{href}" if not href.startswith("http") else href
-                    btn_text = rc["btn_text"]
-                    raw_lang = rc.get("language", "")
-                    # Normalize full language names to 2-letter codes for display
-                    _lang_map = {
-                        "english": "en", "french": "fr", "spanish": "es",
-                        "german": "de", "portuguese": "pt", "italian": "it",
-                        "dutch": "nl", "russian": "ru", "chinese": "zh",
-                        "japanese": "ja", "korean": "ko", "arabic": "ar",
-                    }
-                    language = _lang_map.get(raw_lang, raw_lang[:2] if len(raw_lang) > 2 else raw_lang)
-
-                    # Apply language filter — skip non-matching languages when set
-                    if filter_lang and language and language != filter_lang:
-                        continue
-
-                    if "borrow" in btn_text:
-                        availability, wait = "Available", None
-                    elif "loan" in btn_text or "listen" in btn_text:
-                        availability, wait = "Borrowed", None
-                    else:
-                        availability = "Hold"
-                        wait = rc["inline_wait"] or "On hold"
-
-                    status_text = wait or availability
-
-                    releases.append(Release(
-                        source       = SOURCE_NAME,
-                        source_id    = media_id,
-                        title        = rc["title"],
-                        format       = "m4b",
-                        language     = language or None,
-                        size         = status_text,
-                        size_bytes   = None,
-                        download_url = info_url,
-                        info_url     = info_url,
-                        protocol     = ReleaseProtocol.HTTP,
-                        indexer      = self.display_name,
-                        content_type = content_type,
-                        extra        = {
-                            "media_id":     media_id,
-                            "base_url":     base_url,
-                            "availability": availability,
-                            "author":       rc.get("author", ""),
-                        },
-                    ))
-
-                page.context.browser.close()
-                return releases
-
-        except Exception as exc:
-            raise SourceUnavailableError(f"OverDrive search failed: {exc}") from exc
+        # Sort: Available first, then borrowed, then holds; within each group by title
+        _order = {"Available": 0, "Borrowed": 1, "Hold": 2}
+        all_releases.sort(key=lambda r: (
+            _order.get(r.extra.get("availability", "Hold"), 2),
+            r.title or "",
+        ))
+        return all_releases
 
     def get_column_config(self) -> ReleaseColumnConfig:
         return ReleaseColumnConfig(
@@ -707,13 +771,27 @@ class OverDriveHandler(DownloadHandler):
         if cancel_flag.is_set():
             return None
 
-        cfg      = _get_config()
+        cfg = _get_config()
         # Parse base_url and media_id from source_url (e.g. https://multcolib.overdrive.com/media/12345)
         source_url = task.source_url or ""
-        media_id = source_url.rstrip("/").split("/")[-1]
-        url_parts = source_url.split("/media/")
-        base_url = url_parts[0] if len(url_parts) == 2 else f"https://{cfg['library']}.overdrive.com"
-        title    = task.title or f"overdrive_{media_id}"
+        media_id   = source_url.rstrip("/").split("/")[-1]
+        url_parts  = source_url.split("/media/")
+        base_url   = url_parts[0] if len(url_parts) == 2 else ""
+
+        # Find the account whose library subdomain matches the source URL
+        library_subdomain = base_url.split("//")[-1].split(".")[0] if base_url else ""
+        account = next(
+            (a for a in cfg["accounts"] if a.get("library", "").lower() == library_subdomain.lower()),
+            cfg["accounts"][0] if cfg["accounts"] else None,
+        )
+        if not account:
+            raise SourceUnavailableError("No OverDrive account configured.")
+        card = account["card"]
+        pin  = account["pin"]
+        if not base_url:
+            base_url = f"https://{account['library']}.overdrive.com"
+
+        title = task.title or f"overdrive_{media_id}"
 
         out_dir = TMP_DIR / f"overdrive_{task.task_id}"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -725,7 +803,7 @@ class OverDriveHandler(DownloadHandler):
         try:
             with sync_playwright() as pw:
                 page = _make_browser(pw, headless=cfg["headless"])
-                _login(page, base_url, cfg["card"], cfg["pin"])
+                _login(page, base_url, card, pin)
 
                 if cancel_flag.is_set():
                     return None
@@ -837,7 +915,7 @@ def get_settings_fields() -> list:
     from shelfmark.core.settings_registry import (
         CheckboxField,
         HeadingField,
-        PasswordField,
+        TableField,
         TextField,
     )
     return [
@@ -847,26 +925,40 @@ def get_settings_fields() -> list:
             description=(
                 "Download borrowed audiobooks from your library's OverDrive catalog. "
                 "Searches, borrows, and downloads as M4B with full chapters. "
+                "Add one row per library card — all cards are searched in parallel. "
                 "Requires: pip install playwright requests && playwright install chromium && ffmpeg in PATH."
             ),
         ),
-        TextField(
-            key="OVERDRIVE_LIBRARY",
-            label="Library Subdomain",
-            description="Your library's OverDrive subdomain, e.g. 'multcolib' for multcolib.overdrive.com.",
-            default="multcolib",
-            placeholder="multcolib",
-        ),
-        TextField(
-            key="OVERDRIVE_CARD",
-            label="Library Card Number",
-            description="Your library card / barcode number.",
-            placeholder="998774",
-        ),
-        PasswordField(
-            key="OVERDRIVE_PIN",
-            label="PIN / Password",
-            description="Your library card PIN or password.",
+        TableField(
+            key="OVERDRIVE_ACCOUNTS",
+            label="Library Cards",
+            description=(
+                "Add one row per library card. All cards are searched in parallel and results are combined. "
+                "Library Subdomain is the part before '.overdrive.com' — e.g. 'multcolib' for multcolib.overdrive.com."
+            ),
+            columns=[
+                {
+                    "key": "library",
+                    "label": "Library Subdomain",
+                    "type": "text",
+                    "placeholder": "e.g. multcolib",
+                },
+                {
+                    "key": "card",
+                    "label": "Card Number",
+                    "type": "text",
+                    "placeholder": "e.g. 998774",
+                },
+                {
+                    "key": "pin",
+                    "label": "PIN / Password",
+                    "type": "password",
+                    "placeholder": "••••",
+                },
+            ],
+            add_label="Add Library Card",
+            empty_message="No library cards configured.",
+            default=[],
         ),
         CheckboxField(
             key="OVERDRIVE_HEADLESS",
