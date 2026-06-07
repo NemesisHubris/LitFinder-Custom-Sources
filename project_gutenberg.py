@@ -298,21 +298,15 @@ def get_settings_fields() -> list:
             key="GUTENBERG_INFO_HEADING",
             title="Project Gutenberg — ~75,000 Free Public Domain Ebooks",
             description=(
-                "Results come from the Gutendex API (gutendex.com). "
-                "Popular books often have multiple catalog entries because different "
-                "volunteers have prepared separate editions — different base texts, "
-                "with or without images, different formatting. Use Max Editions to "
-                "control how many appear per search."
+                "Free ebooks via the Gutendex API. Popular titles may have multiple "
+                "editions prepared by different volunteers — use Max Editions to control "
+                "how many appear per search."
             ),
         ),
         NumberField(
             key="GUTENBERG_MAX_EDITIONS",
-            label="Max editions per search",
-            description=(
-                "Gutenberg can have many editions of a popular book. "
-                "Limit how many appear in results. Default 5 shows the most relevant "
-                "without flooding the list."
-            ),
+            label="Max Editions per Search",
+            description="Cap how many editions of the same title appear in results.",
             default=5,
             min_value=1,
             max_value=32,
@@ -320,23 +314,14 @@ def get_settings_fields() -> list:
         ),
         CheckboxField(
             key="GUTENBERG_PREFER_IMAGES",
-            label="Prefer editions with images",
-            description=(
-                "When enabled, Shelfmark prefers the illustrated version of an EPUB "
-                "when Project Gutenberg provides both. Illustrated editions are larger "
-                "(typically 2–5× the file size) but include cover art and inline images."
-            ),
+            label="Prefer illustrated editions",
+            description="Download the version with cover art and images when available. Typically 2–5× larger.",
             default=False,
         ),
         TextField(
             key="GUTENBERG_LANGUAGE",
             label="Language Filter",
-            description=(
-                "Limit results to a specific language using its ISO 639-1 code "
-                "(e.g. 'en' for English, 'de' for German, 'fr' for French). "
-                "Leave empty to search all languages. "
-                "This is passed directly to the Gutendex API."
-            ),
+            description="ISO 639-1 code to limit results (e.g. 'en', 'de', 'fr'). Leave blank for all.",
             default="",
             placeholder="e.g. en",
         ),

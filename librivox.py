@@ -506,20 +506,14 @@ def get_settings_fields() -> list:
             key="LIBRIVOX_INFO_HEADING",
             title="LibriVox — Free Public Domain Audiobooks",
             description=(
-                "LibriVox audiobooks are hosted on the Internet Archive, which provides "
-                "pre-built M4B files (single file with chapter markers), individual MP3 "
-                "chapters (as a ZIP), and BitTorrent. M4B is recommended — it works with "
-                "Audiobookshelf, Apple Books, and most audiobook apps out of the box."
+                "Volunteer-recorded audiobooks, all public domain and free. "
+                "Files are served by the Internet Archive."
             ),
         ),
         SelectField(
             key="LIBRIVOX_AUDIO_FORMAT",
             label="Download Format",
-            description=(
-                "M4B: a single file with all chapters and chapter markers embedded — "
-                "best for audiobook players. MP3 ZIP: a ZIP of individual chapter files. "
-                "Torrent: download via BitTorrent using archive.org's torrent file."
-            ),
+            description="M4B is recommended — single file with chapters, works in most audiobook apps.",
             default="m4b",
             options=[
                 {"value": "m4b", "label": "M4B (single file, chapters)"},
@@ -530,36 +524,25 @@ def get_settings_fields() -> list:
         SelectField(
             key="LIBRIVOX_MP3_QUALITY",
             label="MP3 Quality",
-            description=(
-                "Only applies when Download Format is set to MP3 ZIP. "
-                "VBR files are higher quality but roughly 2× larger than 64 kbps."
-            ),
+            description="VBR is higher quality but ~2× the file size. Only applies to MP3 ZIP.",
             default="64kb",
             options=[
-                {"value": "64kb", "label": "64 kbps (smaller, standard)"},
-                {"value": "vbr", "label": "VBR (higher quality, larger)"},
+                {"value": "64kb", "label": "64 kbps (smaller)"},
+                {"value": "vbr", "label": "VBR (higher quality)"},
             ],
             show_when={"LIBRIVOX_AUDIO_FORMAT": "mp3"},
         ),
         TextField(
             key="LIBRIVOX_LANGUAGE",
             label="Language Filter",
-            description=(
-                "Limit search results to a specific language. Use the full English name "
-                "as returned by LibriVox (e.g. 'English', 'German', 'French'). "
-                "Leave empty to show all languages."
-            ),
+            description="Full English name as used by LibriVox (e.g. 'English', 'German'). Leave blank for all.",
             default="",
             placeholder="e.g. English",
         ),
         CheckboxField(
             key="LIBRIVOX_SOLO_ONLY",
             label="Prefer solo readers",
-            description=(
-                "When enabled, group-read projects are shown only if no solo-reader "
-                "version is available. Has no effect on the LibriVox API query itself — "
-                "filtering is applied locally after results are fetched."
-            ),
+            description="Hide group-read projects when a solo version exists.",
             default=False,
         ),
     ]

@@ -921,20 +921,19 @@ def get_settings_fields() -> list:
     return [
         HeadingField(
             key="OVERDRIVE_HEADING",
-            title="OverDrive / Libby",
+            title="OverDrive / Libby — Library Audiobooks",
             description=(
-                "Download borrowed audiobooks from your library's OverDrive catalog. "
-                "Searches, borrows, and downloads as M4B with full chapters. "
-                "Add one row per library card — all cards are searched in parallel. "
-                "Requires: pip install playwright requests && playwright install chromium && ffmpeg in PATH."
+                "Borrow and download audiobooks from your public library via OverDrive. "
+                "Results download as M4B with chapters. Add multiple cards to search all "
+                "your libraries at once."
             ),
         ),
         TableField(
             key="OVERDRIVE_ACCOUNTS",
             label="Library Cards",
             description=(
-                "Add one row per library card. All cards are searched in parallel and results are combined. "
-                "Library Subdomain is the part before '.overdrive.com' — e.g. 'multcolib' for multcolib.overdrive.com."
+                "The subdomain is the part before '.overdrive.com' — e.g. 'multcolib' "
+                "for multcolib.overdrive.com."
             ),
             columns=[
                 {
@@ -951,7 +950,7 @@ def get_settings_fields() -> list:
                 },
                 {
                     "key": "pin",
-                    "label": "PIN / Password",
+                    "label": "PIN",
                     "type": "password",
                     "placeholder": "••••",
                 },
@@ -962,16 +961,16 @@ def get_settings_fields() -> list:
         ),
         CheckboxField(
             key="OVERDRIVE_HEADLESS",
-            label="Run browser headlessly",
-            description="Hide the browser window during search and download. Recommended.",
+            label="Run browser in background",
+            description="Keep the browser window hidden during search and download.",
             default=True,
         ),
         TextField(
             key="OVERDRIVE_FILTER_LANGUAGE",
-            label="Language filter (optional)",
+            label="Language Filter",
             description=(
-                "Leave blank to show all languages (recommended). "
-                "Set a 2-letter ISO code (e.g. 'en', 'fr', 'es') to hide results in other languages."
+                "ISO 639-1 code to limit results (e.g. 'en', 'fr'). "
+                "Leave blank to show all languages."
             ),
             default="",
             placeholder="e.g. en",
