@@ -1,0 +1,15 @@
+# Python dependencies for LitFinder custom sources
+#
+# Install with:  pip install -r requirements.txt
+#
+# System dependency (not pip):
+#   ffmpeg — required by librivox.py and overdrive_source.py for audio merging
+#   Install via your package manager: sudo dnf install ffmpeg  /  sudo apt install ffmpeg
+#   Already included in the Shelfmark Docker image.
+
+# Required by: librivox.py, project_gutenberg.py, overdrive_source.py
+requests>=2.28.0
+
+# Required by: overdrive_source.py
+# After installing, also run:  playwright install chromium
+playwright>=1.40.0
