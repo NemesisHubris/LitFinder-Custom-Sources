@@ -183,12 +183,6 @@ def _fetch_language_http(detail_url: str, cookies: dict) -> str:
         return ""
 
 
-def _parse_bool(val) -> bool:
-    if isinstance(val, bool):
-        return val
-    return str(val).lower() not in ("false", "0", "no", "")
-
-
 def _get_config():
     from shelfmark.core.settings_registry import load_config_file
     cfg = load_config_file("custom_overdrive_source")
@@ -207,7 +201,6 @@ def _get_config():
 
     return {
         "accounts":        accounts,
-        "headless":        _parse_bool(cfg.get("OVERDRIVE_HEADLESS", True)),
         "filter_language": cfg.get("OVERDRIVE_FILTER_LANGUAGE", "").strip().lower(),
     }
 
@@ -458,7 +451,6 @@ def _search_account(
     account: dict,
     query: str,
     *,
-    headless: bool = True,
     filter_lang: str = "",
     content_type: str = "audiobook",
     display_name: str = "OverDrive / Libby",
@@ -473,7 +465,7 @@ def _search_account(
 
     try:
         with sync_playwright() as pw:
-            page = _make_browser(pw, headless=headless)
+            page = _make_browser(pw, headless=True)
             _login(page, base_url, card, pin)
 
             page.goto(
@@ -679,7 +671,6 @@ class OverDriveSource(ReleaseSource):
             return _search_account(
                 account=account,
                 query=query,
-                headless=cfg["headless"],
                 filter_lang=cfg["filter_language"],
                 content_type=content_type,
                 display_name=self.display_name,
@@ -802,7 +793,7 @@ class OverDriveHandler(DownloadHandler):
 
         try:
             with sync_playwright() as pw:
-                page = _make_browser(pw, headless=cfg["headless"])
+                page = _make_browser(pw, headless=True)
                 _login(page, base_url, card, pin)
 
                 if cancel_flag.is_set():
@@ -913,7 +904,6 @@ class OverDriveHandler(DownloadHandler):
 
 def get_settings_fields() -> list:
     from shelfmark.core.settings_registry import (
-        CheckboxField,
         HeadingField,
         TableField,
         TextField,
@@ -958,12 +948,6 @@ def get_settings_fields() -> list:
             add_label="Add Library Card",
             empty_message="No library cards configured.",
             default=[],
-        ),
-        CheckboxField(
-            key="OVERDRIVE_HEADLESS",
-            label="Run browser in background",
-            description="Keep the browser window hidden during search and download.",
-            default=True,
         ),
         TextField(
             key="OVERDRIVE_FILTER_LANGUAGE",
